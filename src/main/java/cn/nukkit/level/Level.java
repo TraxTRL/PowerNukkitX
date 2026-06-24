@@ -287,6 +287,7 @@ public class Level implements Metadatable {
         randomTickBlocks.add(BlockID.WEEPING_VINES);
         randomTickBlocks.add(BlockID.WATER);
         randomTickBlocks.add(BlockID.MANGROVE_PROPAGULE);
+        randomTickBlocks.add(BlockID.SULFUR_SPIKE);
     }
 
     @NonComputationAtomic
@@ -473,7 +474,7 @@ public class Level implements Metadatable {
         baseTickGameLoop = GameLoop.builder()
                 .onTick(this::doTick)
                 .onStop(this::remove)
-                .loopCountPerSec(20)
+                .loopCountPerSec(server.getBaseTps())
                 .build();
         subTickGameLoop = GameLoop.builder()
                 .onTick(this::subTick)
@@ -606,7 +607,6 @@ public class Level implements Metadatable {
         if (!getChunk(spawn.getChunkX(), spawn.getChunkZ(), true).getChunkState().canSend()) {
             this.generateChunk(spawn.getChunkX(), spawn.getChunkZ());
         }
-        long period = 1000 / 20;
         subTickGameLoop.setRunning(true);
         this.subTickTask = getServer().getLevelTickExecutor().scheduleAtFixedRate(() -> {
             try {
@@ -615,7 +615,7 @@ public class Level implements Metadatable {
             } catch (Throwable t) {
                 log.error("Error in sub-tick for level {}", this.getName(), t);
             }
-        }, 0, period, TimeUnit.MILLISECONDS);
+        }, 0, 50, TimeUnit.MILLISECONDS);
         if (getServer().getSettings().levelSettings().levelThread()) {
             baseTickGameLoop.setRunning(true);
             this.baseTickTask = getServer().getLevelTickExecutor().scheduleAtFixedRate(() -> {
@@ -625,7 +625,7 @@ public class Level implements Metadatable {
                 } catch (Throwable t) {
                     log.error("Error in base-tick for level {}", this.getName(), t);
                 }
-            }, 0, period, TimeUnit.MILLISECONDS);
+            }, 0, server.getBaseMSPT(), TimeUnit.MILLISECONDS);
         }
         log.info(this.server.getLanguage().tr("nukkit.level.init", TextFormat.GREEN + this.getName() + TextFormat.RESET));
     }

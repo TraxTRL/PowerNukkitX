@@ -13,7 +13,6 @@ import cn.nukkit.block.BlockWood;
 import cn.nukkit.block.BlockWool;
 import cn.nukkit.block.customblock.CustomBlock;
 import cn.nukkit.blockentity.BlockEntity;
-import cn.nukkit.blockentity.BlockEntityHangingSign;
 import cn.nukkit.blockentity.BlockEntityItemFrame;
 import cn.nukkit.blockentity.BlockEntitySign;
 import cn.nukkit.blockentity.BlockEntitySpawnable;
@@ -146,6 +145,8 @@ import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
 import org.cloudburstmc.math.vector.Vector3f;
 import org.cloudburstmc.math.vector.Vector3i;
+import org.cloudburstmc.netty.channel.raknet.RakServerChannel;
+import org.cloudburstmc.netty.handler.codec.raknet.common.RakSessionCodec;
 import org.cloudburstmc.protocol.bedrock.BedrockServerSession;
 import org.cloudburstmc.protocol.bedrock.data.*;
 import org.cloudburstmc.protocol.bedrock.data.actor.ActorDataTypes;
@@ -185,6 +186,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 /**
  * Game player object, representing the controlled character
@@ -281,12 +283,12 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
     private final float movementDistanceThreshold;
     protected final Queue<Location> clientMovements = PlatformDependent.newMpscQueue(4);
     /**
-     * Actions handed off from the network thread to be executed on the main tick thread, drained
-     * at the start of {@link #onUpdate}. Block-break completion and inventory transactions are
-     * routed through here so they run serially with the server-auth break tick
-     * (onBlockBreakContinue) instead of racing it on the network thread.
+     * Inbound packets handed off from the netty thread to be dispatched on the main tick thread,
+     * drained in arrival order at the start of {@link #onUpdate}. See {@link #handlePacket}.
      */
-    protected final Queue<Runnable> inboundActions = PlatformDependent.newMpscQueue(8);
+    protected final Queue<BedrockPacket> inboundPackets = PlatformDependent.newMpscQueue();
+    private Consumer<BedrockPacket> inboundProcessor;
+    protected volatile String pendingClose;
     private final AtomicReference<Locale> locale = new AtomicReference<>(null);
     protected int timeSinceRest;
     private String buttonText = "Button";
@@ -338,6 +340,8 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
     // lastUseItem System and item cooldown
     protected final HashMap<String, Integer> cooldownTickMap = new HashMap<>();
     protected final HashMap<String, Integer> lastUseItemMap = new HashMap<>(1);
+    private static final int FERTILIZER_USE_COOLDOWN = 4;
+    private int lastFertilizerUseTick = Integer.MIN_VALUE;
     @Getter
     @Setter
     protected Item lastUsedItem = null;
@@ -412,7 +416,7 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
         this.creationTime = System.currentTimeMillis();
         this.displayName = info.getIdentityClaims().extraData.displayName;
         this.clientChainData = info.getClientChainData();
-        this.uuid = UUID.nameUUIDFromBytes(("pocket-auth-1-xuid:" + this.getXUID()).getBytes(StandardCharsets.UTF_8));
+        this.uuid = Server.uuidFromXUID(this.getXUID());
         final ByteBuffer buffer = ByteBuffer.allocate(16);
         buffer.putLong(this.uuid.getMostSignificantBits());
         buffer.putLong(this.uuid.getLeastSignificantBits());
@@ -1075,31 +1079,54 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
     }
 
     /**
-     * Hands off an action from the network thread to be run on the main tick thread.
-     * <p>
-     * Packet handlers run on the network (netty) thread, while the server-auth block-break tick
-     * ({@code onBlockBreakContinue}) runs on the main thread. Routing block-break completion and
-     * inventory transactions through this queue makes them run serially with the break tick
-     * instead of racing it, which is what allowed instamine break/place to duplicate items.
-     * The action is drained at the start of the next {@link #onUpdate}.
-     *
-     * @param action the action to run on the main thread
+     * Installs the dispatcher used to handle this player's inbound packets. Set once by the network
+     * layer; lets {@link #drainInboundPackets} run a packet through the full handle path without the
+     * player owning that logic.
      */
-    public void scheduleInbound(Runnable action) {
-        if (!this.inboundActions.offer(action)) {
-            log.warn("Failed to enqueue inbound action for player {}", this.getName());
+    public void setInboundProcessor(Consumer<BedrockPacket> processor) {
+        this.inboundProcessor = processor;
+    }
+
+    /**
+     * Queues an inbound packet to be handled on the main tick thread, drained in arrival order at
+     * the start of the next {@link #onUpdate}. Receive-side counterpart of {@link #sendPacket}.
+     * <p>
+     * Packets are decoded on the netty thread but their handlers mutate world, entity and inventory
+     * state that is otherwise only touched by the tick. {@code NetworkPacketHandler} routes every
+     * gameplay packet of a spawned player through here so handling is serialized with the tick
+     * instead of racing it; only handlers flagged
+     * {@link cn.nukkit.network.process.PacketHandler#runsOnNetworkThread()} and the pre-spawn login
+     * sequence are dispatched immediately on the netty thread.
+     */
+    protected void handlePacket(BedrockPacket packet) {
+        if (!this.inboundPackets.offer(packet)) {
+            log.warn("Failed to enqueue inbound packet {} for player {}", packet.getClass().getSimpleName(), this.getName());
         }
     }
 
-    protected void drainInboundActions() {
-        Runnable action;
-        while ((action = this.inboundActions.poll()) != null) {
+    protected void drainInboundPackets() {
+        final Consumer<BedrockPacket> processor = this.inboundProcessor;
+        if (processor == null) {
+            return;
+        }
+        BedrockPacket packet;
+        while ((packet = this.inboundPackets.poll()) != null) {
             try {
-                action.run();
+                processor.accept(packet);
             } catch (Exception e) {
-                log.error("Error while running inbound action for player {}", this.getName(), e);
+                log.error("Error handling inbound packet {} for player {}", packet.getClass().getSimpleName(), this.getName(), e);
             }
         }
+    }
+
+    /**
+     * Requests that this player be closed (disconnected) on its own tick thread, after any already
+     * queued inbound packets have been drained. Called from the netty thread on connection loss so
+     * that the world teardown in {@link #close()} runs serialized with the level tick instead of
+     * racing it. Pre-spawn players are closed directly (see {@code NetworkPacketHandler#onDisconnect}).
+     */
+    public void requestClose(String reason) {
+        this.pendingClose = reason;
     }
 
     /**
@@ -1226,7 +1253,6 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
      * Processing execution in LoginPacket
      */
     public void processLogin() {
-
         if (this.hasPermission(Server.BROADCAST_CHANNEL_USERS)) {
             this.server.getPluginManager().subscribeToPermission(Server.BROADCAST_CHANNEL_USERS, this);
         }
@@ -2067,6 +2093,32 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
     }
 
     /**
+     * Permission that lets a command sender see players' real login names in command output
+     * instead of their (possibly nicked) display names.
+     *
+     * @see #getViewableName(CommandSender)
+     */
+    public static final String VIEW_REAL_NAME_PERMISSION = "nukkit.command.viewrealname";
+
+    /**
+     * Returns this player's name as it should be shown to {@code viewer} in command output.
+     * <p>
+     * By default the display name (nick) is returned to preserve nick systems. A viewer holding
+     * {@link #VIEW_REAL_NAME_PERMISSION} sees the real login name instead.
+     * <p>
+     * Note: this resolves against a single viewer. Messages broadcast to multiple recipients are
+     * rendered once using the command issuer's permission, not per recipient.
+     *
+     * @param viewer the sender the name is being shown to (may be null)
+     * @return the real login name if {@code viewer} has {@link #VIEW_REAL_NAME_PERMISSION}, else the display name
+     */
+    @Override
+    public String getViewableName(CommandSender viewer) {
+        return viewer != null && viewer.hasPermission(VIEW_REAL_NAME_PERMISSION)
+                ? this.getName() : this.getDisplayName();
+    }
+
+    /**
      * Just change the name displayed during player chat and in the server player list (Does not affect the player parameter name of the command, nor does it affect the player header display name)
      *
      * @param displayName The display name
@@ -2233,6 +2285,15 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
         pk.setDurationTicks(coolDown);
         this.cooldownTickMap.put(category, this.getLevel().getTick() + coolDown);
         this.sendPacket(pk);
+    }
+
+    public boolean isFertilizerCoolDownEnd() {
+        return this.lastFertilizerUseTick == Integer.MIN_VALUE
+                || this.getLevel().getTick() - this.lastFertilizerUseTick >= FERTILIZER_USE_COOLDOWN;
+    }
+
+    public void resetFertilizerCoolDown() {
+        this.lastFertilizerUseTick = this.getLevel().getTick();
     }
 
     /**
@@ -2434,7 +2495,10 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
      * @return long
      */
     public long getPing() {
-        return this.playerHandle.getLatencyTimeInMS();
+        var rakServerChannel = (RakServerChannel) this.session.getPeer().getChannel().parent();
+        var childChannel = rakServerChannel.getChildChannel(getSocketAddress());
+        var rakSessionCodec = childChannel.rakPipeline().get(RakSessionCodec.class);
+        return rakSessionCodec.getPing();
     }
 
     public boolean sleepOn(Vector3 pos) {
@@ -2789,6 +2853,7 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
         }
 
         if (!this.isAlive() && this.spawned) {
+            this.drainInboundPackets();
             if (this.getLevel().getGameRules().getBoolean(GameRule.DO_IMMEDIATE_RESPAWN)) {
                 this.despawnFromAll();
                 return true;
@@ -2798,7 +2863,14 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
         }
 
         if (this.spawned) {
-            this.drainInboundActions();
+            this.drainInboundPackets();
+
+            if (this.pendingClose != null) {
+                final String closeReason = this.pendingClose;
+                this.pendingClose = null;
+                this.close(closeReason);
+                return true;
+            }
 
             if (this.motionX != 0 || this.motionY != 0 || this.motionZ != 0) {
                 this.setMotion(new Vector3(motionX, motionY, motionZ));
@@ -3806,9 +3878,9 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
                         if (e instanceof EntityHandItem entityHandItem) {
                             weapon = entityHandItem.getItemInHand();
                         }
-                        if (e instanceof Player) {
+                        if (e instanceof Player pl) {
                             message = "death.attack.player";
-                            params.add(((Player) e).getDisplayName());
+                            params.add(pl.getDisplayName());
                             break;
                         } else if (e instanceof EntityLiving) {
                             message = "death.attack.mob";
@@ -3823,9 +3895,9 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
                     if (cause instanceof EntityDamageByEntityEvent) {
                         Entity e = ((EntityDamageByEntityEvent) cause).getDamager();
                         killer = e;
-                        if (e instanceof Player) {
+                        if (e instanceof Player pl) {
                             message = "death.attack.arrow";
-                            params.add(((Player) e).getDisplayName());
+                            params.add(pl.getDisplayName());
                         } else if (e instanceof EntityLiving) {
                             message = "death.attack.arrow";
                             params.add(!Objects.equals(e.getNameTag(), "") ? e.getNameTag() : e.getName());
@@ -6069,7 +6141,6 @@ public class Player extends EntityHuman implements CommandSender, ChunkLoader, I
         if (runnable != null) {
             this.ackRunnables.put(creationTime, runnable);
         }
-        this.playerHandle.addInflightPingTime(creationTime / 1_000_000L);
         final NetworkStackLatencyPacket packet = new NetworkStackLatencyPacket();
         packet.setCreationTime(creationTime);
         packet.setFromServer(true);

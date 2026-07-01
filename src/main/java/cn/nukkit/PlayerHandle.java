@@ -20,14 +20,13 @@ import com.google.common.collect.BiMap;
 import lombok.Getter;
 import lombok.Setter;
 import org.cloudburstmc.protocol.bedrock.data.PlayerBlockActionData;
+import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
 import org.jetbrains.annotations.NotNull;
 
 import java.net.InetSocketAddress;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A PlayerHandle is used to access a player's protected data.
@@ -36,24 +35,6 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class PlayerHandle {
     public final @NotNull Player player;
     public final @NotNull PacketRateLimiter packetRateLimiter;
-
-    private final Set<Long> inflightPingTimesMS = ConcurrentHashMap.newKeySet();
-
-    @Getter
-    @Setter
-    private long latencyTimeInMS;
-
-    public void addInflightPingTime(long timeMs) {
-        inflightPingTimesMS.add(timeMs);
-        // keep bounded: remove oldest if too many in-flight
-        if (inflightPingTimesMS.size() > 20) {
-            inflightPingTimesMS.stream().min(Long::compare).ifPresent(inflightPingTimesMS::remove);
-        }
-    }
-
-    public boolean removeInflightPingTime(long timeMs) {
-        return inflightPingTimesMS.remove(timeMs);
-    }
 
     public PlayerHandle(@NotNull Player player) {
         this.player = player;
@@ -404,5 +385,9 @@ public final class PlayerHandle {
 
     public void onAckReceive(long creationTime) {
         this.player.onAckReceive(creationTime);
+    }
+
+    public void handlePacket(BedrockPacket packet) {
+        this.player.handlePacket(packet);
     }
 }

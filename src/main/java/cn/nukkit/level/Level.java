@@ -102,6 +102,7 @@ import org.cloudburstmc.protocol.bedrock.data.payload.inventory.transaction.Item
 import org.cloudburstmc.protocol.bedrock.data.payload.inventory.transaction.ItemUseTriggerType;
 import org.cloudburstmc.protocol.bedrock.data.payload.inventory.transaction.data.ItemUseInventoryTransaction;
 import org.cloudburstmc.protocol.bedrock.packet.*;
+import org.jetbrains.annotations.ApiStatus;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -1568,32 +1569,53 @@ public class Level implements Metadatable {
     }
 
     private void tickChunks() {
-        if (this.chunksPerTicks <= 0 || this.loaders.isEmpty()) {
+        if (this.chunksPerTicks == 0 || this.loaders.isEmpty()) {
             this.chunkTickList.clear();
             return;
         }
 
+        boolean shouldTickAll = this.chunksPerTicks < 0;
         int chunksPerLoader = Math.min(200, Math.max(1, (int) (((double) (this.chunksPerTicks - this.loaders.size()) / this.loaders.size() + 0.5))));
-        int randRange = 3 + chunksPerLoader / 30;
-        randRange = Math.min(randRange, this.chunkTickRadius);
-
+        int range = shouldTickAll ? this.chunkTickRadius : Math.min(3 + chunksPerLoader / 30, this.chunkTickRadius);
         ThreadLocalRandom random = ThreadLocalRandom.current();
-        synchronized (this.loaders) {
-            if (!this.loaders.isEmpty()) {
-                for (ChunkLoader loader : this.loaders.values()) {
-                    int chunkX = (int) loader.getX() >> 4;
-                    int chunkZ = (int) loader.getZ() >> 4;
 
-                    long index = Level.chunkHash(chunkX, chunkZ);
-                    int existingLoaders = Math.max(0, this.chunkTickList.getOrDefault(index, 0));
-                    this.chunkTickList.put(index, existingLoaders + 1);
-                    for (int chunk = 0; chunk < chunksPerLoader; ++chunk) {
-                        int dx = random.nextInt(2 * randRange) - randRange;
-                        int dz = random.nextInt(2 * randRange) - randRange;
+        synchronized (this.loaders) {
+            for (ChunkLoader loader : this.loaders.values()) {
+                int chunkX = (int) loader.getX() >> 4;
+                int chunkZ = (int) loader.getZ() >> 4;
+
+                long index = Level.chunkHash(chunkX, chunkZ);
+                int existingLoaders = Math.max(0, this.chunkTickList.getOrDefault(index, 0));
+                this.chunkTickList.put(index, existingLoaders + 1);
+
+                if (shouldTickAll) {
+                    for (int dx = -range; dx <= range; dx++) {
+                        for (int dz = -range; dz <= range; dz++) {
+                            long hash = Level.chunkHash(chunkX + dx, chunkZ + dz);
+                            if (requireProvider().isChunkLoaded(hash)) {
+                                this.chunkTickList.put(hash, -1);
+                            }
+                        }
+                    }
+                } else {
+                    int attempts = 0;
+                    int added = 0;
+                    int maxAttempts = Math.max(chunksPerLoader * 4, (range * 2 + 1) * (range * 2 + 1));
+
+                    while (added < chunksPerLoader && attempts++ < maxAttempts) {
+                        int dx = random.nextInt((range * 2) + 1) - range;
+                        int dz = random.nextInt((range * 2) + 1) - range;
                         long hash = Level.chunkHash(dx + chunkX, dz + chunkZ);
-                        if (!this.chunkTickList.containsKey(hash) && requireProvider().isChunkLoaded(hash)) {
+
+                        if (this.chunkTickList.containsKey(hash)) {
+                            continue;
+                        }
+
+                        if (requireProvider().isChunkLoaded(hash)) {
                             this.chunkTickList.put(hash, -1);
                         }
+
+                        added++;
                     }
                 }
             }
@@ -1804,6 +1826,11 @@ public class Level implements Metadatable {
             normalUpdateQueue.add(new QueuedUpdate(side, face));
             normalUpdateQueue.add(new QueuedUpdate(side.getLevelBlockAtLayer(1), face));
         }
+    }
+
+    @ApiStatus.Internal
+    public Queue<QueuedUpdate> getNormalUpdateQueue() {
+        return normalUpdateQueue;
     }
 
     public void neighborChangeAroundImmediately(int x, int y, int z) {
@@ -3100,7 +3127,11 @@ public class Level implements Metadatable {
 
             if (!ev.isCancelled()) {
                 target.onTouch(vector, item, face, fx, fy, fz, player, ev.getAction());
-                if (ev.getAction() == Action.RIGHT_CLICK_BLOCK && target.canBeActivated() && target.onActivate(item, player, face, fx, fy, fz)) {
+                boolean throttledFertilizer = item.isFertilizer() && !player.isFertilizerCoolDownEnd();
+                if (!throttledFertilizer && ev.getAction() == Action.RIGHT_CLICK_BLOCK && target.canBeActivated() && target.onActivate(item, player, face, fx, fy, fz)) {
+                    if (item.isFertilizer()) {
+                        player.resetFertilizerCoolDown();
+                    }
                     if (item.isTool() && item.getDamage() >= item.getMaxDurability()) {
                         addSound(player, Sound.RANDOM_BREAK);
                         item = Item.AIR;
@@ -5558,7 +5589,7 @@ public class Level implements Metadatable {
 
     @AllArgsConstructor
     @Data
-    private static class QueuedUpdate {
+    public static class QueuedUpdate {
         @NotNull
         private Block block;
         private BlockFace neighbor;

@@ -8,6 +8,7 @@ import cn.nukkit.block.BlockUnknown;
 import cn.nukkit.blockentity.BlockEntity;
 import cn.nukkit.entity.Entity;
 import cn.nukkit.level.DimensionData;
+import cn.nukkit.level.Level;
 import cn.nukkit.level.format.Chunk;
 import cn.nukkit.level.format.ChunkSection;
 import cn.nukkit.level.format.ChunkState;
@@ -33,7 +34,6 @@ import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
 import org.cloudburstmc.nbt.NBTInputStream;
 import org.cloudburstmc.nbt.NBTOutputStream;
 import org.cloudburstmc.nbt.NbtMap;
-import org.cloudburstmc.nbt.NbtType;
 import org.cloudburstmc.nbt.NbtUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.iq80.leveldb.DB;
@@ -460,6 +460,24 @@ public class LevelDBChunkSerializer {
             scheduledTicks.add(tag);
         }
 
+        for (Level.QueuedUpdate queuedUpdate : chunk.getLevel().getNormalUpdateQueue()) {
+            Block block = queuedUpdate.getBlock();
+            if ((block.getFloorX() >> 4) != chunk.getX() || (block.getFloorZ() >> 4) != chunk.getZ()) {
+                continue;
+            }
+
+            CompoundTag tag = new CompoundTag()
+                    .putInt("x", block.getFloorX())
+                    .putInt("y", block.getFloorY())
+                    .putInt("z", block.getFloorZ())
+                    .putString("id", block.getId())
+                    .putInt("layer", block.layer);
+            if (queuedUpdate.getNeighbor() != null) {
+                tag.putInt("neighbor", queuedUpdate.getNeighbor().getIndex());
+            }
+            normalTickBlocks.add(tag);
+        }
+
         CompoundTag extraData = unsafe.getExtraData();
         extraData.putList("pendingScheduledTicks", scheduledTicks);
         extraData.putList("pendingNormalTickBlocks", normalTickBlocks);
@@ -472,7 +490,7 @@ public class LevelDBChunkSerializer {
     }
 
     public static class NormalTickInfo {
-        public int x, y, z;
+        public int x, y, z, layer, neighbor = -1;
         public String id;
     }
 
@@ -518,6 +536,10 @@ public class LevelDBChunkSerializer {
                 info.y = tag.getInt("y");
                 info.z = tag.getInt("z");
                 info.id = tag.getString("id");
+                info.layer = tag.getInt("layer");
+                if (tag.contains("neighbor")) {
+                    info.neighbor = tag.getInt("neighbor");
+                }
                 normalList.add(info);
             }
             if (!normalList.isEmpty()) {
@@ -538,12 +560,11 @@ public class LevelDBChunkSerializer {
     private CompoundTag readBigEndian(byte[] data) {
         try (final ByteArrayInputStream inputStream = new ByteArrayInputStream(data);
              final NBTInputStream nbtInputStream = NbtUtils.createReader(inputStream)) {
-            final int id = inputStream.read();
-            final NbtType<?> type = NbtType.byId(id);
-            if (type == null || !type.equals(NbtType.COMPOUND)) {
+            Object tag = nbtInputStream.readTag();
+            if (!(tag instanceof NbtMap map)) {
                 return null;
             }
-            return CompoundTag.fromNetwork((NbtMap) nbtInputStream.readValue(type));
+            return CompoundTag.fromNetwork(map);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to read big endian nbt", e);
         }
